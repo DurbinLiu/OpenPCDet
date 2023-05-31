@@ -1,8 +1,10 @@
 from functools import partial
-
+import math,torch
+torch.cuda.current_device()
 import numpy as np
 from skimage import transform
 
+from ...ops.pointnet2.pointnet2_stack import pointnet2_utils as pointnet2_stack_utils
 from ...utils import box_utils, common_utils
 
 tv = None
@@ -76,13 +78,16 @@ class DataProcessor(object):
             self.data_processor_queue.append(cur_processor)
 
     def mask_points_and_boxes_outside_range(self, data_dict=None, config=None):
+        # 如果data_dict为空，则返回一个函数，该函数将在稍后被调用
         if data_dict is None:
             return partial(self.mask_points_and_boxes_outside_range, config=config)
 
+        # 如果data_dict中存在points，则将其范围限制在point_cloud_range内
         if data_dict.get('points', None) is not None:
             mask = common_utils.mask_points_by_range(data_dict['points'], self.point_cloud_range)
             data_dict['points'] = data_dict['points'][mask]
 
+        # 如果data_dict中存在gt_boxes，则将其范围限制在point_cloud_range内
         if data_dict.get('gt_boxes', None) is not None and config.REMOVE_OUTSIDE_BOXES and self.training:
             mask = box_utils.mask_boxes_outside_range_numpy(
                 data_dict['gt_boxes'], self.point_cloud_range, min_num_corners=config.get('min_num_corners', 1), 
@@ -91,6 +96,7 @@ class DataProcessor(object):
             data_dict['gt_boxes'] = data_dict['gt_boxes'][mask]
         return data_dict
 
+    # 乱序
     def shuffle_points(self, data_dict=None, config=None):
         if data_dict is None:
             return partial(self.shuffle_points, config=config)
@@ -106,29 +112,14 @@ class DataProcessor(object):
     def transform_points_to_voxels_placeholder(self, data_dict=None, config=None):
         # just calculate grid size
         if data_dict is None:
+            # 网格大小
             grid_size = (self.point_cloud_range[3:6] - self.point_cloud_range[0:3]) / np.array(config.VOXEL_SIZE)
             self.grid_size = np.round(grid_size).astype(np.int64)
             self.voxel_size = config.VOXEL_SIZE
             return partial(self.transform_points_to_voxels_placeholder, config=config)
         
         return data_dict
-
-    def double_flip(self, points):
-        # y flip
-        points_yflip = points.copy()
-        points_yflip[:, 1] = -points_yflip[:, 1]
-
-        # x flip
-        points_xflip = points.copy()
-        points_xflip[:, 0] = -points_xflip[:, 0]
-
-        # x y flip
-        points_xyflip = points.copy()
-        points_xyflip[:, 0] = -points_xyflip[:, 0]
-        points_xyflip[:, 1] = -points_xyflip[:, 1]
-
-        return points_yflip, points_xflip, points_xyflip
-
+        
     def transform_points_to_voxels(self, data_dict=None, config=None):
         if data_dict is None:
             grid_size = (self.point_cloud_range[3:6] - self.point_cloud_range[0:3]) / np.array(config.VOXEL_SIZE)
@@ -154,53 +145,45 @@ class DataProcessor(object):
         if not data_dict['use_lead_xyz']:
             voxels = voxels[..., 3:]  # remove xyz in voxels(N, 3)
 
-        if config.get('DOUBLE_FLIP', False):
-            voxels_list, voxel_coords_list, voxel_num_points_list = [voxels], [coordinates], [num_points]
-            points_yflip, points_xflip, points_xyflip = self.double_flip(points)
-            points_list = [points_yflip, points_xflip, points_xyflip]
-            keys = ['yflip', 'xflip', 'xyflip']
-            for i, key in enumerate(keys):
-                voxel_output = self.voxel_generator.generate(points_list[i])
-                voxels, coordinates, num_points = voxel_output
-
-                if not data_dict['use_lead_xyz']:
-                    voxels = voxels[..., 3:]
-                voxels_list.append(voxels)
-                voxel_coords_list.append(coordinates)
-                voxel_num_points_list.append(num_points)
-
-            data_dict['voxels'] = voxels_list
-            data_dict['voxel_coords'] = voxel_coords_list
-            data_dict['voxel_num_points'] = voxel_num_points_list
-        else:
-            data_dict['voxels'] = voxels
-            data_dict['voxel_coords'] = coordinates
-            data_dict['voxel_num_points'] = num_points
+        data_dict['voxels'] = voxels
+        data_dict['voxel_coords'] = coordinates
+        data_dict['voxel_num_points'] = num_points
         return data_dict
 
+    """
+    点云随机采样，其实就是随机的，从所有的点云采样到16384个。
+    并不是最远点采样
+    选择一些点，凑满num_points，pointrcnn里是16384
+    选点的过程如下:
+    """
     def sample_points(self, data_dict=None, config=None):
         if data_dict is None:
             return partial(self.sample_points, config=config)
 
         num_points = config.NUM_POINTS[self.mode]
-        if num_points == -1:
+        if num_points == -1:  # 意思是不采样吧
             return data_dict
 
         points = data_dict['points']
+
+        # 1、想采样的点云数 < 输入的点云数：划分近点和远点（距原点40m）
         if num_points < len(points):
             pts_depth = np.linalg.norm(points[:, 0:3], axis=1)
             pts_near_flag = pts_depth < 40.0
             far_idxs_choice = np.where(pts_near_flag == 0)[0]
             near_idxs = np.where(pts_near_flag == 1)[0]
             choice = []
+            # （1)若想要的点云数 > 远点数量 ，则从近处随机选点来补充
             if num_points > len(far_idxs_choice):
                 near_idxs_choice = np.random.choice(near_idxs, num_points - len(far_idxs_choice), replace=False)
                 choice = np.concatenate((near_idxs_choice, far_idxs_choice), axis=0) \
                     if len(far_idxs_choice) > 0 else near_idxs_choice
+            # （2）否则，从远处近处随机选
             else: 
                 choice = np.arange(0, len(points), dtype=np.int32)
                 choice = np.random.choice(choice, num_points, replace=False)
             np.random.shuffle(choice)
+        # 2、想采样的点云数 > 输入数： 多出来的，从输入重复随机选取
         else:
             choice = np.arange(0, len(points), dtype=np.int32)
             if num_points > len(points):
@@ -208,6 +191,88 @@ class DataProcessor(object):
                 choice = np.concatenate((choice, extra_choice), axis=0)
             np.random.shuffle(choice)
         data_dict['points'] = points[choice]
+        return data_dict
+
+    # 基于距离的FPS采样
+    def bin_based_fps(self, data_dict=None, config=None, num_sampled_points=[], distance_list=[]):
+        """
+        Args:
+            points: (N, 3)
+            num_sampled_points_list: list[int]
+            distance_list: list[int]
+
+        Returns:
+            sampled_points: (N_out, 3)
+        """
+        if data_dict is None:
+            return partial(self.bin_based_fps, config=config)
+
+        # 在多卡时用cuda，单卡时用cpu
+        device = 'cuda'
+        points = data_dict['points'] # (N, 4)
+        sampled_ratios = config.sampled_ratios # [0.6,  0.7,  0.8, 0.9, 1]
+        distance_list  = config.distance_list # [0,    15,   30,  45,  60, 1000]
+        points_distances = np.linalg.norm(points[:, 0:3], axis=1)
+        points = torch.from_numpy(points).float().to(device)
+        # 初始化一些变量
+        xyzr_points_list = []
+        xyzr_batch_cnt = []
+        num_sampled_points_list = []
+        cur_num_points_list = []
+        for k in range(len(distance_list)-1):
+            # 计算属于该区间的点的掩码      
+            mask = (distance_list[k] <= points_distances) & (points_distances < distance_list[k+1])
+            # 计算该距离区间的点的数量
+            cur_num_points = mask.sum().item() # 转标量
+            # 若当前区间存在点
+            if cur_num_points > 0:
+                # 采样前的点，采用前点的数量，采样后的点的数量
+                xyzr_points_list.append(points[mask])
+                xyzr_batch_cnt.append(cur_num_points)
+                # 计算将采样点的数目
+                cur_num_points_list.append(cur_num_points)
+                num_sampled_points_list.append(
+                    math.ceil(sampled_ratios[k] * cur_num_points)
+                )
+        
+        # print(f'xyz_batch_cnt={xyzr_batch_cnt}')
+        # print(f'num_sampled_points_list={num_sampled_points_list},sum={sum(num_sampled_points_list)}')
+        # print(f'cur_num_points_list={cur_num_points_list},sum={sum(cur_num_points_list)}')
+        # 如果所有距离区间都没有点，几乎不会发生
+        if len(xyzr_batch_cnt) == 0:
+            # 将所有点、点的数量、采样点的数量加入列表
+            xyzr_points_list.append(points)
+            xyzr_batch_cnt.append(len(points))
+            num_sampled_points_list.append(num_sampled_points)
+            print(f'Warning: empty points detected in distance_FPS: points.shape={points.shape}')
+        # 将所有点拼接在一起，注意，这里points里点的顺序变了
+        points = torch.cat(xyzr_points_list, dim=0)
+        # 将每个区间的点的数量转换为张量，.int()把所有元素转换为整数型
+        xyzr_batch_cnt = torch.tensor(xyzr_batch_cnt, device=points.device).int()
+        # 将每个扇形采样点的数量转换为张量
+        sampled_points_batch_cnt = torch.tensor(num_sampled_points_list, device=points.device).int()
+        # 对所有点进行FPS采样
+        sampled_pt_idxs = pointnet2_stack_utils.stack_farthest_point_sample(
+            points[:,0:3].contiguous(), xyzr_batch_cnt, sampled_points_batch_cnt
+        ).long()
+
+        # 为了凑整，额外需要的点
+        num_extra_points = config.NUM_POINTS[self.mode] - sampled_pt_idxs.shape[0]
+        # 额外采样
+        if num_extra_points >= 0:
+            extra_index = torch.from_numpy(np.random.choice(range(points.shape[0]), num_extra_points)).cuda()
+            sampled_pt_idxs = torch.cat([sampled_pt_idxs, extra_index], dim=0)
+            # print(f'sampled_points.shape={sampled_pt_idxs.shape}')
+        # 采样点过多，随机删除 TODO:这里会卡死 
+        elif num_extra_points < 0:
+            sampled_pt_idxs = sampled_pt_idxs[torch.randperm(sampled_pt_idxs.shape[0])][:config.NUM_POINTS[self.mode]]
+            print(f'sampled_points.shape={sampled_pt_idxs.shape}')
+        # 根据采样点的索引得到采样点
+        sampled_points = points[sampled_pt_idxs]
+        # print(f'sampled_points.shape={sampled_points.shape}')
+        if device == 'cuda':
+            sampled_points = sampled_points.cpu()
+        data_dict['points'] = sampled_points.numpy() # sampled_points.cpu().numpy()
         return data_dict
 
     def calculate_grid_size(self, data_dict=None, config=None):
